@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
+from importlib import resources as impresources
 from dataclasses import dataclass
 import math
 import functools
@@ -6,6 +7,7 @@ import functools
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 import fairscale.nn.model_parallel.initialize as fs_init
 from fairscale.nn.model_parallel.layers import (
@@ -13,26 +15,26 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
     ColumnParallelLinear
 )
-from ..peft import LoraColumnParallelLinear, LoraRowParallelLinear
 
 from ..components import RMSNorm
+from transformers import Blip2Processor, Blip2Model, Blip2Config
 import open_clip
 
+import accessory
 from accessory.configs import global_configs
 if global_configs.USE_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
-from accessory.util.tensor_type import default_tensor_type
 
 default_linear_init = functools.partial(nn.init.kaiming_uniform_, a=math.sqrt(5))
 
-from .llama import precompute_freqs_cis, reshape_for_broadcast, apply_rotary_emb, repeat_kv
+from .llama import precompute_freqs_cis, apply_rotary_emb, repeat_kv
 
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
+    dim: int = 5120
+    n_layers: int = 40
+    n_heads: int = 40
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
@@ -45,22 +47,9 @@ class ModelArgs:
 
     rope_scaling: Optional[float] = None
 
-    prefix_layers: Optional[int] = None # number of layers to add prefix, set to n_layers if None is given
-    prefix_len: int = 10
+    load_pretrained_visual_encoder: bool = False
 
-    use_prefix_new_gate: bool = False
-
-    v_embed_dim = 768 # latent dim for clip projection layer
-    v_depth = 8 # number of perceiver layers for clip projection
-    v_num_heads = 16
-    v_mlp_ratio = 4.0
-
-    lora_rank: int = -1 # lora
-    bias_tuning: bool = True  # bias
-    norm_tuning: bool = True
-
-    trainable_mode: str = "sg"  # options: ["sg", "mm_stage1", "mm_stage2"]
-
+    trainable_mode: str = "mm_stage2"  # options: ["mm_stage1", "mm_stage2"]
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -72,37 +61,33 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = LoraColumnParallelLinear(
+        self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=args.bias_tuning,
+            bias=False,
             gather_output=False,
             init_method=default_linear_init,
-            lora_rank=args.lora_rank
         )
-        self.wk = LoraColumnParallelLinear(
+        self.wk = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
             gather_output=False,
             init_method=default_linear_init,
-            lora_rank=args.lora_rank
         )
-        self.wv = LoraColumnParallelLinear(
+        self.wv = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             bias=False,
             gather_output=False,
             init_method=default_linear_init,
-            lora_rank=args.lora_rank
         )
-        self.wo = LoraRowParallelLinear(
+        self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=args.bias_tuning,
+            bias=False,
             input_is_parallel=True,
             init_method=default_linear_init,
-            lora_rank=args.lora_rank
         )
 
         self.args = args
@@ -112,9 +97,7 @@ class Attention(nn.Module):
 
     def forward(
         self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
-        mask: Union[torch.Tensor, str, None],
-        prefix: Optional[torch.Tensor]=None, prefix_gate: Optional[torch.Tensor]=None,
-        prefix_new_gate: Optional[torch.Tensor] = None,
+        mask: Union[torch.Tensor, str, None]
     ) -> torch.Tensor:
         """
         Supported mask spec:
@@ -161,23 +144,9 @@ class Attention(nn.Module):
             self.flash  # user configuration
             and (mask is None or (is_causal and keys.size(1) == xq.size(1)))  # supported mask
         )
-        if prefix is not None:
-            prefix_k = self.wk(prefix).view(bsz, self.args.prefix_len, self.n_local_heads,
-                                                               self.head_dim)
-            prefix_v = self.wv(prefix).view(bsz, self.args.prefix_len, self.n_local_heads,
-                                                               self.head_dim)
-
         if use_flash:
             # repeating k/v heads is included in flash_attn
             output = flash_attn_func(xq, keys, values, dropout_p=0.0, causal=is_causal)
-
-            if prefix is not None:
-                prefix_delta = flash_attn_func(xq, prefix_k, prefix_v, dropout_p=0.0, causal=False)
-                prefix_delta = prefix_gate.view(1, 1, -1, 1).tanh() * prefix_delta
-                if prefix_new_gate is not None:
-                    prefix_delta = prefix_new_gate * prefix_delta
-                output = output + prefix_delta
-
             output = output.contiguous().view(bsz, seqlen, -1)
         else:
             # repeat k/v heads if n_kv_heads < n_heads
@@ -194,18 +163,6 @@ class Attention(nn.Module):
                 else:
                     raise NotImplementedError()
             output = F.scaled_dot_product_attention(xq, keys, values, dropout_p=0.0, attn_mask=mask)
-
-            if prefix is not None:
-                prefix_k = prefix_k.transpose(1, 2)
-                prefix_v = prefix_v.transpose(1, 2)
-                prefix_delta = F.scaled_dot_product_attention(
-                    xq, prefix_k, prefix_v, dropout_p=0.0, is_causal=False
-                )
-                prefix_delta = prefix_gate.view(1, -1, 1, 1).tanh() * prefix_delta
-                if prefix_new_gate is not None:
-                    prefix_delta = prefix_new_gate * prefix_delta
-                output = output + prefix_delta
-
             output = output.transpose(
                 1, 2
             ).contiguous().view(bsz, seqlen, -1)
@@ -235,7 +192,6 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
-        args: ModelArgs,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -244,17 +200,14 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = LoraColumnParallelLinear(
-            dim, hidden_dim, bias=args.bias_tuning, gather_output=False,
-            init_method=default_linear_init, lora_rank=args.lora_rank
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=default_linear_init
         )
-        self.w2 = LoraRowParallelLinear(
-            hidden_dim, dim, bias=args.bias_tuning, input_is_parallel=True,
-            init_method=default_linear_init, lora_rank=args.lora_rank
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=default_linear_init
         )
-        self.w3 = LoraColumnParallelLinear(
-            dim, hidden_dim, bias=args.bias_tuning, gather_output=False,
-            init_method=default_linear_init, lora_rank=args.lora_rank
+        self.w3 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=default_linear_init
         )
 
     # @torch.compile
@@ -277,7 +230,6 @@ class TransformerBlock(nn.Module):
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
-            args=args
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -286,22 +238,19 @@ class TransformerBlock(nn.Module):
     def _forward_ffn(self, h):
         return h + self.feed_forward(self.ffn_norm(h))
 
-    def _forward_attention(self, x, start_pos, freqs_cis, mask, prefix, prefix_gate, prefix_new_gate):
-        return x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, prefix, prefix_gate, prefix_new_gate)
+    def _forward_attention(self, x, start_pos, freqs_cis, mask):
+        return x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
 
     def forward(
         self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        prefix: Optional[torch.Tensor]=None, prefix_gate: Optional[torch.Tensor]=None,
-        prefix_new_gate: Optional[torch.Tensor] = None
+        mask: Union[torch.Tensor, str, None]
     ) -> torch.Tensor:
-        h = self._forward_attention(x, start_pos, freqs_cis, mask, prefix, prefix_gate, prefix_new_gate)
+        h = self._forward_attention(x, start_pos, freqs_cis, mask)
         out = self._forward_ffn(h)
         return out
 
 
 class Transformer(nn.Module):
-    is_peft = True
     def __init__(self, args: ModelArgs, with_visual=False):
         super().__init__()
         self.args = args
@@ -326,80 +275,57 @@ class Transformer(nn.Module):
         )
 
         self.image_words = 0
+        self.cache_image_words = 0 # for inference
         if with_visual:
-            print("build llama model with clip")
-            with default_tensor_type(dtype=torch.half):
-                self.clip, _, _ = open_clip.create_model_and_transforms('ViT-L-14', pretrained='openai',
-                                                                        device=self.output.weight.device)
-                del self.clip.transformer
-            for name, param in self.clip.named_parameters():
-                param.requires_grad = False
-            in_dim = self.clip.visual.proj.shape[1]
-            # in_dim = 3
-            self.clip_proj = nn.Linear(in_dim, args.v_embed_dim)
-            self.clip_proj_norm = nn.LayerNorm(args.v_embed_dim)
-            self.image_words = 0 # images does not occupy LLM input tokens with llama_adapter
+            default_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(torch.float32)
 
-            assert args.prefix_len > 0, "llama_adapter needs prefix if multi modal"
-            self.visual_query = torch.nn.Parameter(torch.zeros(args.prefix_len, args.v_embed_dim))
-            torch.nn.init.normal_(self.visual_query)
-            from timm.models.vision_transformer import Block as ViTBlock
-            self.visual_blocks = nn.ModuleList([
-                ViTBlock(args.v_embed_dim, args.v_num_heads, args.v_mlp_ratio, qkv_bias=True)
-                for _ in range(args.v_depth)])
-            self.visual_proj = nn.Linear(args.v_embed_dim, args.dim)
-            self.visual_proj_norm = nn.LayerNorm(args.dim)
-
-        # prefix tuning with zero-init attention
-        if args.prefix_len > 0:
-            prefix_layers = args.prefix_layers if args.prefix_layers is not None else args.n_layers
-            self.prefix_layers = prefix_layers
-            print(f"create prefix-tuning model with prefix_len {args.prefix_len} and prefix_layers {prefix_layers}")
-            n_local_heads = self.layers[0].attention.n_local_heads
-            self.prefix_gate = torch.nn.Parameter(torch.zeros(prefix_layers, n_local_heads))
-            self.prefix_gate.is_model_parallel = True
-            if args.use_prefix_new_gate:
-                self.prefix_new_gate = torch.nn.Parameter(torch.ones(prefix_layers))
+            print("build llama model with openclip")
+            if self.args.load_pretrained_visual_encoder:
+                self.openclip_convnext_xxl, _, _ = open_clip.create_model_and_transforms(
+                    "convnext_xxlarge", pretrained="laion2b_s34b_b82k_augreg_soup"
+                )
             else:
-                self.prefix_new_gate = [None for _ in range(prefix_layers)]
-            self.prefix = torch.nn.Parameter(torch.zeros(prefix_layers, 1, args.prefix_len, args.dim))
-            torch.nn.init.normal_(self.prefix)
-        else:
-            self.prefix_layers = 0
+                self.openclip_convnext_xxl, _, _ = open_clip.create_model_and_transforms(
+                    "convnext_xxlarge", pretrained=None
+                )
+            self.openclip_convnext_xxl = self.openclip_convnext_xxl.visual.trunk
+            self.openclip_convnext_xxl.head.global_pool = nn.Identity()
+            self.openclip_convnext_xxl.head.flatten = nn.Identity()
+            self.openclip_convnext_xxl.to(self.norm.weight)
 
-        self.cache_actual_prefix = None
+            print("build llama model with dinov2")
+            if self.args.load_pretrained_visual_encoder:
+                self.dinov2_vitg14 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14", pretrained=True)
+            else:
+                self.dinov2_vitg14 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14", pretrained=False)
+            self.dinov2_vitg14.to(self.norm.weight)
+            torch.set_default_dtype(default_dtype)
 
+            self.visual_proj = nn.Sequential(
+                nn.Linear(3072 + 1536, args.dim),
+                nn.LayerNorm(args.dim),
+            )
+
+            self.image_words = 257 + 2
+            self.image_size = 512
+            # add image tags
+            self.start_img = nn.Parameter(torch.rand(1, 1, args.dim))
+            self.end_img = nn.Parameter(torch.rand(1, 1, args.dim))
 
     def get_trainable_params(self):
         trainable = {}
-        for name, para in self.named_parameters():
-            if self.args.trainable_mode == "mm_stage2": # multi-modal stage2
-                exclude_prefix = ['clip.', 'clip_proj', 'visual_']
-                trainable_key_words = ['bias', 'lora']
-                if self.args.norm_tuning:
-                    trainable_key_words.append("norm")
-            elif self.args.trainable_mode == "mm_stage1": # multi-modal stage1
-                exclude_prefix = ['clip.']
-                # according to the paper, lora and bias do not exist in this stage
-                # but if you add them in this stage, they will also be trained
-                trainable_key_words = ['clip_proj', 'visual_', 'bias', 'prefix', 'lora']
-                if self.args.norm_tuning:
-                    trainable_key_words.append("norm")
-            elif self.args.trainable_mode == "sg":  # single-modal
-                # clip_proj and visual_ should not exist
-                exclude_prefix = ['clip.', 'clip_proj', 'visual_']
-                trainable_key_words = ['bias', 'prefix', 'lora']
-                if self.args.norm_tuning:
-                    trainable_key_words.append("norm")
-            else:
-                raise ValueError(f"unknown trainable_mode: {self.args.trainable_mode}")
-            if any([name.startswith(_) for _ in exclude_prefix]): # only tune those within real llama
-                continue
-            if any([_ in name for _ in trainable_key_words]):
-                trainable[name] = para
+        if self.args.trainable_mode == "mm_stage1":
+            for name, para in self.named_parameters():
+                if "visual_proj" in name:
+                    trainable[name] = para
+        elif self.args.trainable_mode == "mm_stage2":
+            no_train_prefix = ["qformer.", "openclip_convnext_xxl.", "clip.", "dinov2_vitg14."]
+            for name, para in self.named_parameters():
+                if not any([name.startswith(_) for _ in no_train_prefix]):
+                    trainable[name] = para
 
         return trainable
-
 
     @torch.no_grad()
     def clip_encode_image(self, x):
@@ -409,7 +335,9 @@ class Transformer(nn.Module):
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat([self.clip.visual.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1,
-                      x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+                                                                                  x.shape[-1], dtype=x.dtype,
+                                                                                  device=x.device), x],
+                      dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.clip.visual.positional_embedding.to(x.dtype)
         x = self.clip.visual.ln_pre(x)
 
@@ -420,57 +348,85 @@ class Transformer(nn.Module):
         # preserve all spatial tokens
         x = self.clip.visual.ln_post(x[:, :, :])
 
-        if self.clip.visual.proj is not None:
-            x = x @ self.clip.visual.proj
-
         return x
 
+    def encode_image(self, image):
+        # images should be of size [bsz, 512, 512]
+        self.openclip_convnext_xxl.eval()
+        self.dinov2_vitg14.eval()
 
-    def encode_image(self, imgs):
-        clip_feats = self.clip_encode_image(imgs)
-        clip_feats = self.clip_proj_norm(self.clip_proj(clip_feats))
+        image_bs = image.size(0)
+        mp_world_size = fs_init.get_model_parallel_world_size()
+        mp_rank = fs_init.get_model_parallel_rank()
+        # assert image_bs % mp_world_size == 0
 
-        visual_query = self.visual_query.unsqueeze(
-            0).repeat(len(imgs), 1, 1)
-        visual_query = torch.cat([visual_query, clip_feats], dim=1)
-        for block in self.visual_blocks:
-            visual_query = block(visual_query)
+        n_pad_items = (mp_world_size - image_bs % mp_world_size) % mp_world_size
+        padded_image = torch.cat([image, image[:1].expand(n_pad_items, *image.size()[1:])], dim=0)
+        padded_image_bs = padded_image.shape[0]
 
-        visual_query = visual_query[:, :self.args.prefix_len, :]
-        visual_query = self.visual_proj(visual_query)
-        visual_query = self.visual_proj_norm(visual_query)
+        local_image_bs = padded_image_bs // mp_world_size
+        local_image = padded_image[local_image_bs * mp_rank: local_image_bs * (mp_rank + 1)]
+        with torch.no_grad():
+            local_image_224 = F.interpolate(local_image.half(), size=(224,224), mode="bicubic").to(local_image)
 
-        return visual_query
+            local_convnext_image_feats = self.openclip_convnext_xxl(
+                F.interpolate(local_image.half(), size=(512, 512)).to(local_image)
+            )
+            assert local_convnext_image_feats.size()[1:] == (3072, 16, 16)
+            local_convnext_image_feats = local_convnext_image_feats.flatten(-2).permute(0, 2, 1)  # (*, 256, 3072)
+            local_convnext_image_feats = torch.cat([
+                local_convnext_image_feats.mean(dim=1, keepdim=True),  # add gap as cls token
+                local_convnext_image_feats,
+            ], dim=1)  # (*, 257, 3072)
 
+            clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073])
+            clip_mean = clip_mean.to(local_image, non_blocking=True).view(3, 1, 1)
+            clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711])
+            clip_std = clip_std.to(local_image, non_blocking=True).view(3, 1, 1)
+            dinov2_mean = torch.Tensor([0.485, 0.456, 0.406]).to(local_image, non_blocking=True).view(3, 1, 1)
+            dinov2_std = torch.Tensor([0.229, 0.224, 0.225]).to(local_image, non_blocking=True).view(3, 1, 1)
+            local_dinov2_image_feats = self.dinov2_vitg14.forward_features(
+                local_image_224 * (clip_std / dinov2_std) + (clip_mean - dinov2_mean) / dinov2_std
+            )
+            local_dinov2_image_feats = torch.cat([
+                local_dinov2_image_feats["x_norm_clstoken"].unsqueeze(1),
+                local_dinov2_image_feats["x_norm_patchtokens"],
+            ], dim=1)
+            local_ens_image_feats = torch.cat([
+                local_convnext_image_feats,
+                local_dinov2_image_feats,
+            ], dim=2)  # (*, 257, 4608)
+
+            ens_image_feats = torch.zeros([padded_image_bs, *local_ens_image_feats.size()[1:]],
+                                          device=local_ens_image_feats.device, dtype=local_ens_image_feats.dtype)
+            dist.all_gather_into_tensor(ens_image_feats, local_ens_image_feats,
+                                        group=fs_init.get_model_parallel_group())
+
+            ens_image_feats = ens_image_feats[:image_bs]
+
+        ens_image_feats = self.visual_proj(ens_image_feats)
+
+        return ens_image_feats
 
     def forward(self, examples, image=None):
         self._destroy_kv_cache()  # training always disables kv cache
-        self.cache_actual_prefix = None # training always disables prefix cache
         _bsz, seqlen = examples.shape
         h = self.tok_embeddings(examples)
         self.freqs_cis = self.freqs_cis.to(h.device)
 
+        image_words = 0
         if image is not None:
-            visual_query = self.encode_image(image)
-            actual_prefix = self.prefix + visual_query.unsqueeze(0) # [layers, bsz, seq, dim]
-        else:
-            actual_prefix = self.prefix.repeat(1, _bsz, 1, 1)
+            h_bos, h_caption = h[:, :1], h[:, 1:]
+            image_tokens = self.encode_image(image)
+            h = torch.cat((h_bos, self.start_img.expand(_bsz, -1, -1), image_tokens, self.end_img.expand(_bsz, -1, -1), h_caption), dim=1)
+            image_words = image_tokens.shape[1] + 1 + 1
+            seqlen = h.shape[1]
 
         freqs_cis = self.freqs_cis[:seqlen]
-        for layer in self.layers[:-1 * self.prefix_layers]:
+        for layer in self.layers:
             h = layer(h, start_pos=0, freqs_cis=freqs_cis, mask="causal")
-        prefix_index = 0
-        for layer in self.layers[-1 * self.prefix_layers:]:
-            prefix_gate_this_layer = self.prefix_gate[prefix_index]
-            prefix_new_gate_this_layer = self.prefix_new_gate[prefix_index]
-            prefix_this_layer = actual_prefix[prefix_index]
-            h = layer(h, start_pos=0, freqs_cis=freqs_cis, mask="causal",
-                      prefix=prefix_this_layer, prefix_gate=prefix_gate_this_layer,
-                      prefix_new_gate=prefix_new_gate_this_layer)
-            prefix_index += 1
-
         h = self.norm(h)
-        output = self.output(h)
+        output = self.output(h[:, image_words:, :])
         return output
 
 
@@ -484,32 +440,37 @@ class Transformer(nn.Module):
 
         if image is not None:
             assert start_pos == 0
-            visual_query = self.encode_image(image)
-            self.cache_actual_prefix = self.prefix + visual_query.unsqueeze(0)
-        elif start_pos == 0:
-            self.cache_actual_prefix = self.prefix.repeat(1, _bsz, 1, 1)
-
-        freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]
+            h_bos, h_caption = h[:, :1], h[:, 1:]
+            image_tokens = self.encode_image(image)
+            self.cache_image_words = image_tokens.shape[1] + 1 + 1
+            h = torch.cat((
+                h_bos,
+                self.start_img.repeat(_bsz, 1, 1),
+                image_tokens,
+                self.end_img.repeat(_bsz, 1, 1),
+                h_caption,
+            ), dim=1).to(h_bos)
+            seqlen = h.shape[1]
+            freqs_cis = self.freqs_cis[0: seqlen]
+        else:
+            if start_pos == 0:
+                self.cache_image_words = 0
+                freqs_cis = self.freqs_cis[0: seqlen]
+            else:
+                # if image was not None when start_pos=0,
+                # the offset should be added to start_pos within later forward_inference calls
+                start_pos = start_pos + self.cache_image_words
+                freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]
 
         # Despite that "causal" also works for seqlen == 1, keep it to None for possibly
         # better performance
         mask = None if seqlen == 1 else "causal"
 
-        for layer in self.layers[:-1 * self.prefix_layers]:
-            h = layer(h, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask)
-        prefix_index = 0
-        for layer in self.layers[-1 * self.prefix_layers:]:
-            prefix_gate_this_layer = self.prefix_gate[prefix_index]
-            prefix_new_gate_this_layer = self.prefix_new_gate[prefix_index]
-            prefix_this_layer = self.cache_actual_prefix[prefix_index]
-            h = layer(h, start_pos=start_pos, freqs_cis=freqs_cis, mask=mask,
-                      prefix=prefix_this_layer, prefix_gate=prefix_gate_this_layer,
-                      prefix_new_gate=prefix_new_gate_this_layer)
-            prefix_index += 1
-
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
-        return output
+        return output.float()
 
     def _allocate_kv_cache(self, max_batch_size: int) -> None:
         for layer in self.layers:
@@ -518,3 +479,14 @@ class Transformer(nn.Module):
     def _destroy_kv_cache(self) -> None:
         for layer in self.layers:
             layer.attention.destroy_kv_cache()
+
+    def get_quant_blocklist(self) -> List[str]:
+        vision_prefixes = [
+            "clip.", "openclip_convnext_xxl.", "dinov2_vitg14.", "qformer.",
+            "visual_proj.", "qformer_proj.",
+        ]
+        blocklist = []
+        for n, m in self.named_modules():
+            if any(n.startswith(x) for x in vision_prefixes):
+                blocklist.append(n)
+        return blocklist

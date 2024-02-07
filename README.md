@@ -17,9 +17,13 @@
 ✨Within this toolkit, we present **SPHINX**, a versatile multimodal large language model (MLLM) that combines a diverse array of training tasks, data domains, and visual embeddings.
 
 ## News
-
-
-- **[2024-1-2]** We release the [SPHINX-MoE](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX), a MLLM based on Mixtral-8x7B-MoE.
+- **[2024-1-27]** [SPHINX-MoE](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX) achieves **29.57%** and **29.33%** accuracy results on [CMMMU-test](https://github.com/CMMMU-Benchmark/CMMMU) and [CMMMU-val](https://github.com/CMMMU-Benchmark/CMMMU) respectively.
+- **[2024-1-24]** [SPHINX-MoE](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX) achieves new SOTA performance (**49.33%**) on [MMVP](https://github.com/tsb0601/MMVP), higher than GPT-4V! 🔥🔥🔥
+- **[2024-1-20]** [SPHINX-MoE](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX) achieves SOTA performance on [AesBench](https://github.com/yipoh/AesBench/tree/main)! 🔥🔥🔥
+- **[2024-1-18]** [LLaMA-Adapter](https://arxiv.org/pdf/2303.16199.pdf) is accepted by **ICLR 2024**!🎉
+- **[2024-1-12]** We release SPHINX-Tiny built on the compact 1.1B [TinyLlama](https://huggingface.co/TinyLlama/TinyLlama-1.1B-intermediate-step-1195k-token-2.5T) that everyone can play with! 🔥🔥🔥
+- **[2024-1-5]** [OpenCompass](https://github.com/open-compass/opencompass) now supports seamless evaluation of all LLaMA2-Accessory models. 🔥🔥🔗[Doc](https://llama2-accessory.readthedocs.io/en/latest/evaluation.html)
+- **[2024-1-2]** We release the [SPHINX-MoE](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX), a MLLM based on Mixtral-8x7B-MoE. 🔥🔥🔥
 - **[2023-12-12]** [SPHINX-V2](https://github.com/Alpha-VLLM/LLaMA2-Accessory/tree/main/SPHINX) achieve outstanding results in [InfiMM-Eval](https://paperswithcode.com/sota/visual-question-answering-vqa-on-core-mm), ranking just below GPT4-V! 🔥🔥🔥
 - **[2023-12-11]** We now support [mixtral-8x7b](https://llama2-accessory.readthedocs.io/en/latest/projects/mixtral-8x7b.html) inference and finetuning! 🔥🔥🔥
 - **[2023-12-08]** We release [OneLLM](https://github.com/csuhan/OneLLM) which aligns **eight** modalities to language using a unified framework!🔥🔥🔥

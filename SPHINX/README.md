@@ -8,7 +8,9 @@ Try out our [web demo 🚀](http://imagebind-llm.opengvlab.com/) here!
 </p>
 
 ## News
-* **[2023-11-17]** We release SPHINX-V2, featuring the same architecture but with enhanced and broader capabilities! 🔥🔥🔥
+* **[2024-1-12]** We release SPHINX-Tiny built on the compact 1.1B [TinyLlama](https://huggingface.co/TinyLlama/TinyLlama-1.1B-intermediate-step-1195k-token-2.5T) that everyone can play with! 🔥🔥🔥
+* **[2024-1-5]** We release SPHINX-MoE supercharged with the powerful [Mixtral 8x7B](https://llama2-accessory.readthedocs.io/en/latest/projects/mixtral-8x7b.html) Backbone! 🔥🔥🔥
+* **[2023-11-17]** We release SPHINX-V2, the same architecture but enhanced capabilities! 🔥🔥
 * **[2023-11-09]** We release the [technical report](https://github.com/Alpha-VLLM/LLaMA2-Accessory/blob/main/SPHINX/SPHINX_paper.pdf) of SPHINX 🔥.
 * **[2023-10-17]** We release the demo, code, and model of SPHINX 🎉.
 
@@ -41,6 +43,7 @@ On top of SPHINX, we propose to further mix visual scales and sub-images for bet
   pip install -e .
   ```
   After this, you will be able to invoke `import accessory` or `import SPHINX` without the restriction of working directory.
++ For SPHINX-MoE, [megablocks](https://github.com/stanford-futuredata/megablocks/) and [stk](https://github.com/stanford-futuredata/stk) should be additionally installed according their the official guides.
 + To enable the segmentation ability shown in our official demo, SAM is also needed:
     ``` bash
     pip install git+https://github.com/facebookresearch/segment-anything.git
@@ -50,11 +53,15 @@ On top of SPHINX, we propose to further mix visual scales and sub-images for bet
 
 We release the following checkpoints:
 
-| Name         | Architecture                                      | Checkpoint                                                   |
-| ------------ | ------------------------------------------------- | ------------------------------------------------------------ |
-| SPHINX       | [llama_ens](../accessory/model/LLM/llama_ens.py)  | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX)/[Baidu](https://pan.baidu.com/s/1HE6NoF1ZawhMgJxeh9r2kQ?pwd=46s7)(提取码：46s7) |
-| SPHINX-1K    | [llama_ens5](../accessory/model/LLM/llama_ens.py) | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-1k)/[Baidu](https://pan.baidu.com/s/1SRfyFGJdapaUTgYZOAdXyg?pwd=pua9)(提取码：pua9) |
-| SPHINX-v2-1k | [llama_ens5](../accessory/model/LLM/llama_ens.py) | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-v2-1k)/[Baidu](https://pan.baidu.com/s/1PKCf515EGmSnSZ8teERHjQ?pwd=88z0)(提取码：88z0) |
+| Name           | Architecture                                                      | Checkpoint                                                                                                                                                                               |
+|----------------|-------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| SPHINX         | [llama_ens](../accessory/model/LLM/llama_ens.py)                  | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX)/[Baidu](https://pan.baidu.com/s/1HE6NoF1ZawhMgJxeh9r2kQ?pwd=46s7)(提取码：46s7)       |
+| SPHINX-1K      | [llama_ens5](../accessory/model/LLM/llama_ens.py)                 | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-1k)/[Baidu](https://pan.baidu.com/s/1SRfyFGJdapaUTgYZOAdXyg?pwd=pua9)(提取码：pua9)    |
+| SPHINX-v2-1k   | [llama_ens5](../accessory/model/LLM/llama_ens.py)                 | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-v2-1k)/[Baidu](https://pan.baidu.com/s/1PKCf515EGmSnSZ8teERHjQ?pwd=88z0)(提取码：88z0) |
+| SPHINX-MoE     | [mixtral_sparse_ens](../accessory/model/LLM/mixtral_sparse_ens.py) | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-MoE)                                                                               |
+| SPHINX-MoE-1k  | [mixtral_sparse_ens5](../accessory/model/LLM/mixtral_sparse_ens5.py) | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-MoE-1k)                                                                            |
+| SPHINX-Tiny    | [llama_ens_light.py](../accessory/model/LLM/llama_ens_light.py)   | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-Tiny)                                                                              |
+| SPHINX-Tiny-1k | [llama_ens5_light.py](../accessory/model/LLM/llama_ens5_light.py) | [Hugging face](https://huggingface.co/Alpha-VLLM/LLaMA2-Accessory/tree/main/finetune/mm/SPHINX/SPHINX-Tiny-1k)                                                                           |
 
 *Note that SPHINX-1K was previously called Long-SPHINX*
 
@@ -86,16 +93,14 @@ model = SPHINXModel.from_pretrained(pretrained_path="path/to/checkpoint", with_v
 image = Image.open("examples/1.jpg")
 qas = [["What's in the image?", None]]
 
-with torch.cuda.amp.autocast(dtype=torch.float16):
-    response = model.generate_reponse(qas, image, max_gen_len=1024, temperature=0.9, top_p=0.5, seed=0)
+response = model.generate_response(qas, image, max_gen_len=1024, temperature=0.9, top_p=0.5, seed=0)
 
 print(response)
 
 # if you wanna continue
 qas[-1][-1] = response
 qas.append(["Then how does it look like?", None])
-with torch.cuda.amp.autocast(dtype=torch.float16):
-    response2 = model.generate_reponse(qas, image, max_gen_len=1024, temperature=0.9, top_p=0.5, seed=0)
+response2 = model.generate_response(qas, image, max_gen_len=1024, temperature=0.9, top_p=0.5, seed=0)
 
 print(response2)
 ```
@@ -129,15 +134,15 @@ def main(world_size, rank) -> None:
     image = Image.open("examples/1.jpg")
     qas = [["What's in the image?", None]]
 
-    with torch.cuda.amp.autocast(dtype=torch.float16):
-        response = model.generate_reponse(qas, image, max_gen_len=1024, temperature=0.9, top_p=0.5, seed=0)
+    response = model.generate_response(qas, image, max_gen_len=1024, temperature=0.9, top_p=0.5, seed=0)
 
 
 if __name__ == "__main__":
     N_GPU = 2
+    assert N_GPU in [1, 2, 4, 8]
     if N_GPU == 1:
         main(world_size=1, rank=0)
-    elif N_GPU == 2:
+    else:
         # You can use whatever method, e.g. torchrun, slurm, etc. for distributed launch
         # Just be sure to initialize torch distributed (by invoking dist.init_process_group)
         # before creating the SPHINX model if model parallel size > 1 is used
@@ -145,8 +150,6 @@ if __name__ == "__main__":
         for rank in range(N_GPU):
             process = mp.Process(target=main, args=(N_GPU, rank))
             process.start()
-    else:
-        raise ValueError("Currently only 1 or 2 is supported for MODEL_PARALLEL_SIZE")
 ```
 If torchrun is preferred, an example is [inference.py](inference.py):
 ```bash
@@ -233,6 +236,9 @@ data_config=path/to/data_config.yaml
 
 data_parallel=sdp
 model_parallel=2
+
+lr=0.00002  # We recommend 5e-6 for SPHINX-MoE and SPHINX-MoE-1k, and 2e-5 for others
+
 exp_name=finetune/imagenet/sphinx-v2-1k/
 echo "exp name: $exp_name"
 mkdir -p output/"$exp_name"
@@ -241,7 +247,7 @@ srun python -u main_finetune.py \
 --output_dir output/"$exp_name" --epochs 1 --warmup_epochs 0.03 \
 --batch_size 4 --accum_iter 4 --num_workers 2 \
 --max_words 512 \
---lr 0.00002 --min_lr 0 --clip_grad 8 --weight_decay 0 \
+--lr "$lr" --min_lr 0 --clip_grad 8 --weight_decay 0 \
 --data_parallel "$data_parallel" --model_parallel_size "$model_parallel" --checkpointing \
 --llama_type llama_ens5 --llama_config $llama_config --tokenizer_path "$tokenizer_path" \
 --pretrained_path "$pretrained_path" --pretrained_type="$pretrained_type" \

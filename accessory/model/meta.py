@@ -123,11 +123,11 @@ class MetaModel(nn.Module):
             raise ValueError("pretrained_path should be specified")
 
         for i, path in enumerate(pretrained_path):
-            if os.path.isdir(path):  # else path on disk, directly load
-                pass
-            else:  # load from huggingface
-                path = misc.cached_file_from_hf(path)
-                pretrained_path[i] = path
+            if path.startswith("hf://"):
+                print(f"load {path} from huggingface...")
+                cached_path = misc.cached_file_from_hf(path)
+                pretrained_path[i] = cached_path
+                print(f"{path} cached to {cached_path}")
 
         if mp_group is None:
             print(f"mp_group not provided. Load model with model parallel size == 1")
@@ -275,6 +275,9 @@ class MetaModel(nn.Module):
         if isinstance(examples[0], str):
             examples = [self.tokenizer.encode(_, bos, eos) for _ in examples]
 
+        if images is not None:
+            images = images.to(list(self.parameters())[0].device)
+
         l_seq_len = [len(_) for _ in examples]
         bsz = len(examples)
         max_length = max(l_seq_len)
@@ -335,6 +338,9 @@ class MetaModel(nn.Module):
             # namely example should start with context
             assert all([e[:len(c)] == c for e, c in zip(examples, contexts)])
 
+        if images is not None:
+            images = images.to(list(self.parameters())[0].device)
+
         logits = self.compute_logits(examples, images)
 
         loss_func = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=0)
@@ -370,7 +376,6 @@ class MetaModel(nn.Module):
         max_gen_len: int = 512,
         temperature: float = 0.0,
         top_p: float = 0.95,
-        return_logits: bool = False,
         additional_stop_symbols: Iterable[str] = ()
     ) -> List[str]:
         """
@@ -383,13 +388,15 @@ class MetaModel(nn.Module):
         :param temperature: Controls randomness in generation. Higher values lead to more random outputs.
          Default is 0.0, namely deterministic generation.
         :param top_p: Top-p sampling probability for more diverse generation. Default is 0.95.
-        :param return_logits: If True, returns logits output by the last token instead of text. Default is False.
         :param additional_stop_symbols: Iterable of additional symbols to stop generation.
         :return: A list of generated text responses corresponding to each input prompt.
         """
 
         if isinstance(prompts, str):
             raise ValueError(f"{self.__class__}.generate expects a batched LIST of prompts, but str is given")
+
+        if images is not None:
+            images = images.to(list(self.parameters())[0].device)
 
         bsz = len(prompts)
         args = self.llma.args
@@ -417,12 +424,9 @@ class MetaModel(nn.Module):
         start_pos = min_prompt_size
         prev_pos = 0
 
-        if return_logits:
-            return self.llma.forward_inference(
-                tokens[:, :start_pos], prev_pos, images if prev_pos == 0 else None
-            ).float()
-
-        l_stop_tokens = [[self.tokenizer.eos_id]] + [self.tokenizer.encode_segment(_) for _ in additional_stop_symbols]
+        l_stop_tokens = [[self.tokenizer.eos_id]]
+        l_stop_tokens += [self.tokenizer.encode_segment(_) for _ in additional_stop_symbols]
+        l_stop_tokens += [self.tokenizer.encode_wo_prefix_space(_) for _ in additional_stop_symbols]
         l_stop_tokens = [torch.tensor(_, dtype=tokens.dtype, device=tokens.device) for _ in l_stop_tokens]
         stopped = torch.tensor([False for _ in range(bsz)], device=input_text_mask.device)
         stop_pos = torch.tensor([start_pos + 1 for _ in range(bsz)], device=input_text_mask.device)
@@ -497,6 +501,7 @@ class MetaModel(nn.Module):
             else:
                 assert len(image.shape) == 3
                 image = image.unsqueeze(0)
+            image = image.to(list(self.parameters())[0].device)
 
         max_prompt_size = max_seq_len - max_gen_len
         prompt_tokens = prompt_tokens[-max_prompt_size:]
